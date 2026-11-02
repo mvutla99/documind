@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DocuMind: ask your documents</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #677084; --line: #e3e6ec;
+    --accent: #2f6fed; --accent-soft: #e8f0ff; --danger: #c43d3d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; align-items: baseline; gap: 12px; }
+  header h1 { margin: 0; font-size: 20px; }
+  header span { color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: 300px 1fr; gap: 20px; padding: 20px 24px; max-width: 1200px; margin: 0 auto; height: calc(100vh - 62px); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; display: flex; flex-direction: column; min-height: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 12px; }
+  #drop { border: 2px dashed var(--line); border-radius: 8px; padding: 20px; text-align: center; color: var(--muted); cursor: pointer; transition: .15s; }
+  #drop.over, #drop:hover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+  #docs { list-style: none; padding: 0; margin: 14px 0 0; overflow-y: auto; flex: 1; }
+  #docs li { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 14px; gap: 8px; }
+  #docs small { color: var(--muted); display: block; }
+  #docs button { background: none; border: none; color: var(--danger); cursor: pointer; font-size: 18px; }
+  details { margin-top: 12px; font-size: 13px; color: var(--muted); }
+  details input { width: 100%; margin-top: 6px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; }
+  #status { font-size: 13px; color: var(--muted); min-height: 20px; margin-top: 8px; }
+  #chat { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding-right: 4px; }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; }
+  .user { align-self: flex-end; background: var(--accent); color: #fff; }
+  .bot { align-self: flex-start; background: var(--bg); border: 1px solid var(--line); }
+  .cite { display: inline-block; background: var(--accent-soft); color: var(--accent); border-radius: 4px; padding: 0 5px; font-size: 12px; font-weight: 600; margin: 0 1px; }
+  .sources { margin-top: 10px; display: grid; gap: 6px; }
+  .source { font-size: 12.5px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; color: var(--muted); white-space: normal; }
+  .source b { color: var(--text); }
+  .empty { color: var(--muted); text-align: center; margin: auto; }
+  form { display: flex; gap: 8px; margin-top: 12px; }
+  form input { flex: 1; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font: inherit; }
+  form button { padding: 10px 18px; border: none; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+  form button:disabled { opacity: .5; cursor: default; }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; height: auto; } #chat { min-height: 50vh; } }
+</style>
+</head>
+<body>
+<header><h1>DocuMind</h1><span id="model">Ask questions about your documents and get cited answers</span></header>
+<main>
+  <section class="panel">
+    <h2>Documents</h2>
+    <div id="drop">Drop PDF, TXT or MD files here<br>or click to choose</div>
+    <input id="file" type="file" accept=".pdf,.txt,.md" multiple hidden>
+    <div id="status"></div>
+    <ul id="docs"></ul>
+    <details><summary>API key (only if the server requires one)</summary><input id="key" type="password" placeholder="X-API-Key"></details>
+  </section>
+  <section class="panel">
+    <h2>Chat</h2>
+    <div id="chat"><p class="empty" id="empty">Upload a document, then ask a question.<br>Try the files in <code>sample_docs/</code>.</p></div>
+    <form id="ask"><input id="q" placeholder="e.g. How many PTO days do employees get?" autocomplete="off" required><button>Ask</button></form>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const headers = (extra = {}) => { const k = $("key").value.trim(); return k ? { ...extra, "X-API-Key": k } : extra; };
+const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const withCites = (s) => esc(s).replace(/\[(\d+)\]/g, '<span class="cite">$1</span>');
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: headers(opts.headers) });
+  if (!r.ok) {
+    let detail = r.statusText;
+    try { detail = (await r.json()).detail; } catch {}
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  return r;
+}
+
+async function loadDocs() {
+  try {
+    const docs = await (await api("/documents")).json();
+    $("docs").innerHTML = docs.length ? "" : '<li><small>No documents yet</small></li>';
+    for (const d of docs) {
+      const li = document.createElement("li");
+      li.innerHTML = `<div>${esc(d.filename)}<small>${d.num_chunks} chunks · ${d.num_pages} page(s)</small></div>`;
+      const del = document.createElement("button");
+      del.title = "Delete"; del.textContent = "×";
+      del.onclick = async () => { await api(`/documents/${d.doc_id}`, { method: "DELETE" }); loadDocs(); };
+      li.appendChild(del);
+      $("docs").appendChild(li);
+    }
+  } catch (e) { $("status").textContent = e.message; }
+}
+
+async function upload(files) {
+  for (const f of files) {
+    $("status").textContent = `Indexing ${f.name}…`;
+    const body = new FormData(); body.append("file", f);
+    try {
+      const r = await api("/documents", { method: "POST", body });
+      $("status").textContent = r.status === 200 ? `${f.name} was already indexed` : `Indexed ${f.name}`;
+    } catch (e) { $("status").textContent = `${f.name}: ${e.message}`; }
+  }
+  loadDocs();
+}
+
+const drop = $("drop");
+drop.onclick = () => $("file").click();
+$("file").onchange = (e) => upload(e.target.files);
+drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); upload(e.dataTransfer.files); };
+
+function bubble(cls, html) {
+  $("empty")?.remove();
+  const div = document.createElement("div");
+  div.className = `msg ${cls}`; div.innerHTML = html;
+  $("chat").appendChild(div); $("chat").scrollTop = $("chat").scrollHeight;
+  return div;
+}
+
+$("ask").onsubmit = async (e) => {
+  e.preventDefault();
+  const question = $("q").value.trim(); if (!question) return;
+  $("q").value = ""; const btn = e.target.querySelector("button"); btn.disabled = true;
+  bubble("user", esc(question));
+  const bot = bubble("bot", "…");
+  let text = "", citations = [];
+  try {
+    const r = await api("/ask/stream", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question }) });
+    const reader = r.body.getReader(); const decoder = new TextDecoder(); let buf = "";
+    while (true) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n"); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const ev = JSON.parse(line);
+        if (ev.type === "citations") citations = ev.citations || [];
+        if (ev.type === "token") { text += ev.text; bot.innerHTML = withCites(text); }
+      }
+      $("chat").scrollTop = $("chat").scrollHeight;
+    }
+    const used = citations.filter((c) => text.includes(`[${c.source}]`));
+    if (used.length) {
+      bot.innerHTML += '<div class="sources">' + used.map((c) =>
+        `<div class="source"><span class="cite">${c.source}</span> <b>${esc(c.filename)}</b>${c.page ? ` · page ${c.page}` : ""} · score ${c.score.toFixed(2)}<br>${esc(c.snippet)}</div>`
+      ).join("") + "</div>";
+    }
+  } catch (err) { bot.textContent = `Error: ${err.message}`; }
+  btn.disabled = false; $("q").focus();
+};
+
+fetch("/health").then((r) => r.json()).then((h) => { $("model").textContent = `LLM: ${h.llm} · embeddings: ${h.embedder}`; }).catch(() => {});
+loadDocs();
+</script>
+</body>
+</html>

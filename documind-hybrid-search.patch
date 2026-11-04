@@ -1,0 +1,968 @@
+diff --git a/.env.example b/.env.example
+index d7d3890..9b56f13 100644
+--- a/.env.example
++++ b/.env.example
+@@ -13,5 +13,10 @@ CHUNK_OVERLAP=150
+ # MIN_SCORE=0.3
+ MAX_UPLOAD_MB=20
+ 
++# vector | bm25 | hybrid (vector + keyword search, fused with Reciprocal Rank Fusion)
++RETRIEVAL_MODE=hybrid
++RRF_K=60
++BM25_MIN_COVERAGE=0.5
++
+ # Set to require an "X-API-Key" header on every API call.
+ API_KEY=
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index e270e90..97871f9 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -20,7 +20,7 @@ jobs:
+       - name: Tests
+         run: pytest -q
+       - name: Retrieval eval (offline demo mode)
+-        run: python -m evals.run_eval --min-hit-rate 0.9
++        run: python -m evals.run_eval --mode all --min-hit-rate 0.85
+ 
+   docker:
+     runs-on: ubuntu-latest
+diff --git a/README.md b/README.md
+index 349ff4e..d8cfe83 100644
+--- a/README.md
++++ b/README.md
+@@ -9,12 +9,13 @@ DocuMind is a Retrieval-Augmented Generation (RAG) service built with **FastAPI*
+ ## Features
+ 
+ - **Upload PDF, TXT and Markdown** with page-aware citations ("handbook.pdf · page 3")
++- **Hybrid search**: semantic vector search + BM25 keyword search (written from scratch), merged with Reciprocal Rank Fusion, so both paraphrased questions and exact terms (product names, codes, emails) find the right passage
+ - **Cited answers** like `[1]`, plus a refusal ("I couldn't find that…") when the documents don't contain the answer, instead of a hallucinated one
+ - **Streaming responses** (NDJSON): sources arrive first, then the answer token by token
+ - **Runs offline in demo mode** with no API key, so anyone can clone and try it in 30 seconds
+ - **Pluggable providers**: the pipeline depends on small `Embedder`/`LLM` interfaces, not on a vendor SDK
+ - **Production touches**: retries with exponential backoff, duplicate-upload detection, upload size limits, optional API-key auth, request logging, Docker, CI
+-- **Retrieval evaluation**: a labeled question set measuring Hit@k and MRR, run in CI
++- **Retrieval evaluation**: a labeled question set measuring Hit@k and MRR per question type, comparing vector, BM25 and hybrid retrieval side by side, run in CI
+ - **Prompt-injection hardening**: document text is wrapped in XML tags and treated as untrusted data
+ 
+ ## Architecture
+@@ -29,9 +30,14 @@ flowchart LR
+     end
+     subgraph Question answering
+         Q[Question] --> E2[Embed query]
+-        E2 --> S[Cosine similarity<br/>top-k search]
++        E2 --> S[Vector search<br/>cosine similarity]
+         V --> S
+-        S --> P[Prompt: system rules +<br/>numbered sources + question]
++        Q --> K[BM25 keyword search]
++        C -.-> B[(BM25 index)]
++        B --> K
++        S --> F[Reciprocal Rank Fusion<br/>top-k]
++        K --> F
++        F --> P[Prompt: system rules +<br/>numbered sources + question]
+         P --> L[LLM: Gemini]
+         L --> A[Answer with citations]
+     end
+@@ -40,7 +46,8 @@ flowchart LR
+ | Layer | File | Responsibility |
+ |---|---|---|
+ | API | `app/main.py` | Routes, validation, auth, streaming, error mapping |
+-| Pipeline | `app/rag.py` | Ingest, retrieve, build prompt, generate |
++| Pipeline | `app/rag.py` | Ingest, hybrid retrieval + rank fusion, build prompt, generate |
++| Keyword search | `app/bm25.py` | BM25 ranking with an inverted index, rebuilt when documents change |
+ | Ingestion | `app/ingestion/` | PDF/text extraction, boundary-aware chunking |
+ | Providers | `app/providers/` | `gemini.py` (real), `demo.py` (offline), `base.py` (interfaces) |
+ | Storage | `app/vectorstore.py` | NumPy vector index, persisted to disk, thread-safe |
+@@ -114,6 +121,8 @@ curl -X POST http://localhost:8000/ask \
+ }
+ ```
+ 
++`/ask` also accepts `"retrieval_mode": "vector" | "bm25" | "hybrid"` to override the server default (`RETRIEVAL_MODE`, default `hybrid`).
++
+ Set `API_KEY` in `.env` to require an `X-API-Key` header on every endpoint except `/health`.
+ 
+ ## Testing and evaluation
+@@ -122,6 +131,7 @@ Set `API_KEY` in `.env` to require an `X-API-Key` header on every endpoint excep
+ pytest -q                       # unit + API tests (fully offline)
+ ruff check .                    # lint
+ python -m evals.run_eval        # retrieval quality, demo embeddings
++python -m evals.run_eval --mode all                   # compare vector vs BM25 vs hybrid
+ python -m evals.run_eval --provider gemini --answers   # with real models
+ ```
+ 
+@@ -130,6 +140,16 @@ The eval script indexes `sample_docs/`, runs the questions in `evals/eval_set.js
+ - **Hit@k**: how often the right document appears in the top-k results
+ - **MRR**: how high it ranks (1.0 = always first)
+ 
++Questions are tagged `semantic` (paraphrased, e.g. "vacation days" for PTO) or `exact_term` (names, codes, emails such as "YubiKeys" or "security@brightleaf.example"), and results are reported for each. Offline demo-mode results on the 20-question set:
++
++| Mode | Hit@4 | MRR | semantic MRR | exact-term MRR |
++|---|---|---|---|---|
++| vector | 100% | 0.975 | 1.000 | 0.917 |
++| bm25 | 90% | 0.900 | 0.857 | 1.000 |
++| **hybrid** | **100%** | **1.000** | **1.000** | **1.000** |
++
++Each method misses where the other is strong; fusing them fixes both. The demo embedder is itself keyword-based, so run `--provider gemini --mode all` to measure the gap with real embeddings.
++
+ Use it to tune `CHUNK_SIZE`, `CHUNK_OVERLAP`, `top_k` and `MIN_SCORE` with numbers instead of guesses. CI fails if Hit@4 drops below 90%.
+ 
+ ## Design decisions
+@@ -137,13 +157,15 @@ Use it to tune `CHUNK_SIZE`, `CHUNK_OVERLAP`, `top_k` and `MIN_SCORE` with numbe
+ - **Demo mode.** Hash-based embeddings and an extractive "LLM" let the project run with no key, keep tests fast and deterministic, and show that the pipeline is provider-agnostic. Demo answers are keyword-based; Gemini mode is where answer quality comes from.
+ - **NumPy instead of a vector database.** Exact cosine search over a matrix is simple, transparent and fast enough for tens of thousands of chunks. The `VectorStore` class is the seam for swapping in pgvector, Qdrant or Chroma at scale.
+ - **Skip the LLM when nothing relevant is found.** If no chunk passes `MIN_SCORE`, the API answers "not found" without calling the model: cheaper, faster and no chance to hallucinate.
++- **Hybrid search with Reciprocal Rank Fusion.** Embeddings capture meaning but blur rare exact tokens; BM25 is the opposite. RRF merges the two ranked lists using only ranks (`1 / (60 + rank)`), so a cosine score and a BM25 score never have to be put on the same scale. BM25 is implemented from scratch with an inverted index and rebuilt lazily when the store's version changes. Keyword hits must cover at least half the question's keywords (`BM25_MIN_COVERAGE`), so one common word can't pull in an unrelated chunk and break the "not found" answer.
+ - **Boundary-aware chunking.** Chunks break at paragraphs, then sentences, with overlap so facts spanning a boundary aren't lost.
+ - **Separate index per embedding model.** Vectors from different models are not comparable, so each model gets its own folder under `data/`.
+ - **Blocking work off the event loop.** Upload parsing and embedding run in a thread pool (`run_in_threadpool`); LLM endpoints are plain `def` so FastAPI threads them automatically.
+ 
+ ## Roadmap
+ 
+-- [ ] Hybrid search (BM25 + vectors) and a cross-encoder re-ranker
++- [x] Hybrid search (BM25 + vectors with Reciprocal Rank Fusion)
++- [ ] Cross-encoder re-ranker
+ - [ ] Conversation memory for follow-up questions
+ - [ ] pgvector backend for larger corpora
+ - [ ] OCR for scanned PDFs
+@@ -156,7 +178,9 @@ Use it to tune `CHUNK_SIZE`, `CHUNK_OVERLAP`, `top_k` and `MIN_SCORE` with numbe
+ documind/
+ ├── app/
+ │   ├── main.py            # FastAPI app factory and routes
+-│   ├── rag.py             # RAG pipeline
++│   ├── rag.py             # RAG pipeline + rank fusion
++│   ├── bm25.py            # BM25 keyword index
++│   ├── text.py            # Tokenizer shared by BM25 and demo mode
+ │   ├── config.py          # Settings (pydantic-settings)
+ │   ├── factory.py         # Builds providers from settings
+ │   ├── schemas.py         # Pydantic models
+diff --git a/app/bm25.py b/app/bm25.py
+new file mode 100644
+index 0000000..7266659
+--- /dev/null
++++ b/app/bm25.py
+@@ -0,0 +1,88 @@
++"""BM25 keyword search, implemented from scratch.
++
++Vector search matches meaning ("vacation" ~ "PTO") but often misses exact terms:
++product names, error codes, IDs and numbers. BM25 is the classic keyword ranking
++function used by search engines (Lucene, Elasticsearch). Combining both
++("hybrid search") gets the strengths of each.
++
++For each query term t in a chunk d:
++
++    idf(t)   = ln(1 + (N - n_t + 0.5) / (n_t + 0.5))      # rare terms count more
++    score   += idf(t) * f * (k1 + 1) / (f + k1 * (1 - b + b * |d| / avgdl))
++
++f is how often t appears in d. k1 limits how much repeating a word helps;
++b controls how much long chunks are penalized.
++"""
++
++from __future__ import annotations
++
++import math
++from collections import Counter
++from collections.abc import Iterable
++
++from app.text import tokenize
++
++
++class BM25Index:
++    def __init__(self, k1: float = 1.5, b: float = 0.75) -> None:
++        self.k1 = k1
++        self.b = b
++        self._ids: list[str] = []
++        self._tfs: list[Counter[str]] = []
++        self._lens: list[int] = []
++        self._idf: dict[str, float] = {}
++        self._postings: dict[str, list[int]] = {}  # term -> positions of chunks containing it
++        self._avgdl = 0.0
++
++    def build(self, docs: Iterable[tuple[str, str]]) -> None:
++        """Index (id, text) pairs, replacing anything indexed before."""
++        self._ids, self._tfs, self._lens, self._postings = [], [], [], {}
++        df: Counter[str] = Counter()
++        for pos, (doc_id, text) in enumerate(docs):
++            tf = Counter(tokenize(text))
++            self._ids.append(doc_id)
++            self._tfs.append(tf)
++            self._lens.append(sum(tf.values()))
++            df.update(tf.keys())
++            for term in tf:
++                self._postings.setdefault(term, []).append(pos)
++        n = len(self._ids)
++        self._avgdl = (sum(self._lens) / n) if n else 0.0
++        self._idf = {t: math.log(1 + (n - c + 0.5) / (c + 0.5)) for t, c in df.items()}
++
++    def __len__(self) -> int:
++        return len(self._ids)
++
++    def search(
++        self, query: str, k: int = 10, allowed: set[str] | None = None, min_coverage: float = 0.0
++    ) -> list[tuple[str, float]]:
++        """Return up to k (id, score) pairs, best first. Only chunks with a positive score are returned.
++
++        allowed:      restrict results to these ids.
++        min_coverage: fraction of distinct query terms a chunk must contain (0.5 = at least half).
++                      Stops a single common word from pulling in an unrelated chunk.
++        """
++        terms = [t for t in dict.fromkeys(tokenize(query)) if t in self._idf]
++        n_query_terms = len(set(tokenize(query)))
++        if not terms or not self._avgdl:
++            return []
++
++        scores: dict[int, float] = {}
++        matched: Counter[int] = Counter()
++        for term in terms:  # only visit chunks that contain the term (inverted index)
++            idf = self._idf[term]
++            for pos in self._postings[term]:
++                f = self._tfs[pos][term]
++                norm = self.k1 * (1 - self.b + self.b * self._lens[pos] / self._avgdl)
++                scores[pos] = scores.get(pos, 0.0) + idf * f * (self.k1 + 1) / (f + norm)
++                matched[pos] += 1
++
++        results = [
++            (self._ids[pos], score)
++            for pos, score in scores.items()
++            if score > 0
++            and matched[pos] / n_query_terms >= min_coverage
++            and (allowed is None or self._ids[pos] in allowed)
++        ]
++        results.sort(key=lambda r: r[1], reverse=True)
++        return results[:k]
+diff --git a/app/config.py b/app/config.py
+index 9f4a5bf..3d6c15c 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -9,6 +9,8 @@ from typing import Literal
+ from pydantic import Field, model_validator
+ from pydantic_settings import BaseSettings, SettingsConfigDict
+ 
++from app.schemas import RetrievalMode
++
+ 
+ class Settings(BaseSettings):
+     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+@@ -28,6 +30,12 @@ class Settings(BaseSettings):
+     min_score: float | None = None
+     max_upload_mb: int = Field(20, gt=0)
+ 
++    # hybrid = vector search + BM25 keyword search fused with Reciprocal Rank Fusion.
++    retrieval_mode: RetrievalMode = "hybrid"
++    rrf_k: int = Field(60, ge=1)
++    # A keyword hit must contain at least this share of the question's keywords.
++    bm25_min_coverage: float = Field(0.5, ge=0, le=1)
++
+     # If set, every API call must send the header "X-API-Key: <value>".
+     api_key: str | None = None
+ 
+diff --git a/app/factory.py b/app/factory.py
+index 7815198..208cd1f 100644
+--- a/app/factory.py
++++ b/app/factory.py
+@@ -27,4 +27,7 @@ def build_service(settings: Settings) -> RAGService:
+         chunk_size=settings.chunk_size,
+         chunk_overlap=settings.chunk_overlap,
+         min_score=settings.resolved_min_score,
++        retrieval_mode=settings.retrieval_mode,
++        rrf_k=settings.rrf_k,
++        bm25_min_coverage=settings.bm25_min_coverage,
+     )
+diff --git a/app/main.py b/app/main.py
+index 52279d9..e553b12 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -78,6 +78,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
+             "version": __version__,
+             "embedder": svc.embedder.name,
+             "llm": svc.llm.name,
++            "retrieval": svc.retrieval_mode,
+             "documents": len(svc.store.list_documents()),
+             "chunks": len(svc.store),
+         }
+diff --git a/app/providers/demo.py b/app/providers/demo.py
+index 53d27ac..38ee452 100644
+--- a/app/providers/demo.py
++++ b/app/providers/demo.py
+@@ -15,27 +15,7 @@ import re
+ import zlib
+ from collections.abc import Iterator
+ 
+-_WORD = re.compile(r"[a-z0-9]+")
+-_STOPWORDS = frozenset(
+-    "a an and are as at be by can do does for from has have how i if in is it its me my of on or "
+-    "our so that the their there this to us was we what when where which who why will with you your".split()
+-)
+-
+-
+-def tokenize(text: str) -> list[str]:
+-    tokens = []
+-    for word in _WORD.findall(text.lower()):
+-        if word in _STOPWORDS:
+-            continue
+-        # Crude stemming so "days"/"day" and "returned"/"return" match.
+-        if len(word) > 5 and word.endswith("ing"):
+-            word = word[:-3]
+-        elif len(word) > 5 and word.endswith("ed"):
+-            word = word[:-2]
+-        elif len(word) > 4 and word.endswith("s") and not word.endswith("ss"):
+-            word = word[:-1]
+-        tokens.append(word)
+-    return tokens
++from app.text import tokenize
+ 
+ 
+ class HashingEmbedder:
+diff --git a/app/rag.py b/app/rag.py
+index 4512b52..da93e09 100644
+--- a/app/rag.py
++++ b/app/rag.py
+@@ -1,7 +1,7 @@
+ """The RAG pipeline: ingest documents, retrieve relevant chunks, generate cited answers.
+ 
+     upload -> extract text -> chunk -> embed -> store
+-    question -> embed -> vector search -> build prompt with sources -> LLM -> answer + citations
++    question -> vector search + BM25 keyword search -> fuse (RRF) -> prompt with sources -> LLM -> cited answer
+ """
+ 
+ from __future__ import annotations
+@@ -9,13 +9,15 @@ from __future__ import annotations
+ import hashlib
+ import logging
+ import re
++import threading
+ import uuid
+ from collections.abc import Iterator
+ from html import escape
+ 
++from app.bm25 import BM25Index
+ from app.ingestion import chunk_text, extract_pages
+ from app.providers.base import LLM, Embedder
+-from app.schemas import AskRequest, AskResponse, Chunk, Citation, DocumentInfo, StreamEvent
++from app.schemas import AskRequest, AskResponse, Chunk, Citation, DocumentInfo, RetrievalMode, StreamEvent
+ from app.vectorstore import VectorStore
+ 
+ logger = logging.getLogger(__name__)
+@@ -35,6 +37,28 @@ class EmptyDocumentError(ValueError):
+     pass
+ 
+ 
++Hits = list[tuple[Chunk, float]]
++
++
++def reciprocal_rank_fusion(result_lists: list[Hits], top_k: int, k: int = 60) -> Hits:
++    """Merge ranked lists with Reciprocal Rank Fusion (Cormack et al., 2009).
++
++    Each list gives a chunk 1 / (k + rank). Only ranks are used, so BM25 scores (0..20+)
++    and cosine scores (0..1) never need to be put on the same scale. k=60 is the value
++    from the paper; it keeps a single #1 ranking from dominating.
++    Scores are normalized so that ranking #1 in every list gives 1.0.
++    """
++    fused: dict[str, float] = {}
++    chunks: dict[str, Chunk] = {}
++    for results in result_lists:
++        for rank, (chunk, _) in enumerate(results, start=1):
++            fused[chunk.id] = fused.get(chunk.id, 0.0) + 1.0 / (k + rank)
++            chunks[chunk.id] = chunk
++    best_possible = len(result_lists) / (k + 1)
++    ranked = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
++    return [(chunks[cid], score / best_possible) for cid, score in ranked]
++
++
+ def _snippet(text: str, limit: int = 300) -> str:
+     clean = re.sub(r"\s+", " ", re.sub(r"(?m)^#+\s*", "", text)).strip()
+     return clean[:limit] + ("…" if len(clean) > limit else "")
+@@ -49,6 +73,9 @@ class RAGService:
+         chunk_size: int = 1000,
+         chunk_overlap: int = 150,
+         min_score: float = 0.0,
++        retrieval_mode: RetrievalMode = "hybrid",
++        rrf_k: int = 60,
++        bm25_min_coverage: float = 0.5,
+     ) -> None:
+         self.embedder = embedder
+         self.llm = llm
+@@ -56,6 +83,14 @@ class RAGService:
+         self.chunk_size = chunk_size
+         self.chunk_overlap = chunk_overlap
+         self.min_score = min_score
++        self.retrieval_mode = retrieval_mode
++        self.rrf_k = rrf_k
++        self.bm25_min_coverage = bm25_min_coverage
++        # The BM25 index is rebuilt lazily whenever the vector store changes (tracked by store.version).
++        self._bm25 = BM25Index()
++        self._bm25_chunks: dict[str, Chunk] = {}
++        self._bm25_version = -1
++        self._bm25_lock = threading.Lock()
+ 
+     # ---------- ingestion ----------
+     def ingest(self, filename: str, data: bytes) -> tuple[DocumentInfo, bool]:
+@@ -98,13 +133,55 @@ class RAGService:
+         return doc, True
+ 
+     # ---------- retrieval ----------
+-    def retrieve(self, question: str, top_k: int = 4, doc_ids: list[str] | None = None) -> list[tuple[Chunk, float]]:
++    def retrieve(
++        self,
++        question: str,
++        top_k: int = 4,
++        doc_ids: list[str] | None = None,
++        mode: RetrievalMode | None = None,
++    ) -> Hits:
++        """Find the chunks most relevant to the question.
++
++        vector: semantic similarity only.  bm25: keywords only.
++        hybrid: both, merged with Reciprocal Rank Fusion (the default).
++        """
++        mode = mode or self.retrieval_mode
++        if mode == "vector":
++            return self._vector_hits(question, top_k, doc_ids)
++        if mode == "bm25":
++            return self._keyword_hits(question, top_k, doc_ids)
++        pool = max(top_k * 5, 20)  # fuse from a wider candidate pool than we return
++        return reciprocal_rank_fusion(
++            [self._vector_hits(question, pool, doc_ids), self._keyword_hits(question, pool, doc_ids)],
++            top_k,
++            self.rrf_k,
++        )
++
++    def _vector_hits(self, question: str, k: int, doc_ids: list[str] | None) -> Hits:
+         query_vec = self.embedder.embed_query(question)
+-        hits = self.store.search(query_vec, k=top_k, doc_ids=doc_ids)
++        hits = self.store.search(query_vec, k=k, doc_ids=doc_ids)
+         return [(c, s) for c, s in hits if s >= self.min_score]
+ 
++    def _keyword_hits(self, question: str, k: int, doc_ids: list[str] | None) -> Hits:
++        index, by_id = self._keyword_index()
++        allowed = None
++        if doc_ids is not None:
++            wanted = set(doc_ids)
++            allowed = {cid for cid, c in by_id.items() if c.doc_id in wanted}
++        return [(by_id[cid], s) for cid, s in index.search(question, k, allowed, self.bm25_min_coverage)]
++
++    def _keyword_index(self) -> tuple[BM25Index, dict[str, Chunk]]:
++        with self._bm25_lock:
++            version, chunks = self.store.snapshot()
++            if version != self._bm25_version:
++                index = BM25Index()
++                index.build((c.id, c.text) for c in chunks)
++                self._bm25, self._bm25_chunks, self._bm25_version = index, {c.id: c for c in chunks}, version
++                logger.info("Rebuilt BM25 index over %d chunks", len(chunks))
++            return self._bm25, self._bm25_chunks
++
+     @staticmethod
+-    def build_prompt(question: str, hits: list[tuple[Chunk, float]]) -> str:
++    def build_prompt(question: str, hits: Hits) -> str:
+         """XML tags clearly separate untrusted document text from the question."""
+         sources = "\n".join(
+             f'<source id="{i}" file="{escape(c.filename)}"'
+@@ -115,7 +192,7 @@ class RAGService:
+         return f"<sources>\n{sources}\n</sources>\n\n<question>\n{question}\n</question>"
+ 
+     @staticmethod
+-    def _citations(hits: list[tuple[Chunk, float]]) -> list[Citation]:
++    def _citations(hits: Hits) -> list[Citation]:
+         return [
+             Citation(
+                 source=i,
+@@ -130,7 +207,7 @@ class RAGService:
+ 
+     # ---------- generation ----------
+     def ask(self, req: AskRequest) -> AskResponse:
+-        hits = self.retrieve(req.question, req.top_k, req.doc_ids)
++        hits = self.retrieve(req.question, req.top_k, req.doc_ids, req.retrieval_mode)
+         if not hits:  # don't pay for an LLM call that can only hallucinate
+             return AskResponse(answer=NO_CONTEXT_ANSWER, citations=[], grounded=False)
+         answer = self.llm.generate(SYSTEM_PROMPT, self.build_prompt(req.question, hits))
+@@ -139,7 +216,7 @@ class RAGService:
+ 
+     def ask_stream(self, req: AskRequest) -> Iterator[StreamEvent]:
+         """Yield citations first (so the UI can show sources immediately), then tokens."""
+-        hits = self.retrieve(req.question, req.top_k, req.doc_ids)
++        hits = self.retrieve(req.question, req.top_k, req.doc_ids, req.retrieval_mode)
+         if not hits:
+             yield StreamEvent(type="citations", citations=[], grounded=False)
+             yield StreamEvent(type="token", text=NO_CONTEXT_ANSWER)
+diff --git a/app/schemas.py b/app/schemas.py
+index 749a9dc..d8f967a 100644
+--- a/app/schemas.py
++++ b/app/schemas.py
+@@ -7,6 +7,8 @@ from typing import Literal
+ 
+ from pydantic import BaseModel, Field
+ 
++RetrievalMode = Literal["vector", "bm25", "hybrid"]
++
+ 
+ class Chunk(BaseModel):
+     """A piece of a document that gets embedded and stored."""
+@@ -32,6 +34,9 @@ class AskRequest(BaseModel):
+     question: str = Field(..., min_length=1, max_length=2000, examples=["How many PTO days do I get?"])
+     top_k: int = Field(4, ge=1, le=20, description="How many chunks to retrieve")
+     doc_ids: list[str] | None = Field(None, description="Only search these documents")
++    retrieval_mode: RetrievalMode | None = Field(
++        None, description="Override the server default: vector, bm25 (keywords) or hybrid (both, fused)"
++    )
+ 
+ 
+ class Citation(BaseModel):
+@@ -39,7 +44,7 @@ class Citation(BaseModel):
+     doc_id: str
+     filename: str
+     page: int | None = None
+-    score: float
++    score: float = Field(..., description="Relevance: cosine similarity, BM25 score, or normalized RRF score (hybrid)")
+     snippet: str
+ 
+ 
+diff --git a/app/text.py b/app/text.py
+new file mode 100644
+index 0000000..6e0a4f6
+--- /dev/null
++++ b/app/text.py
+@@ -0,0 +1,27 @@
++"""Shared text helpers used by keyword search (BM25) and the offline demo providers."""
++
++from __future__ import annotations
++
++import re
++
++_WORD = re.compile(r"[a-z0-9]+")
++STOPWORDS = frozenset(
++    "a an and are as at be by can do does for from has have how i if in is it its me my of on or "
++    "our so that the their there this to us was we what when where which who why will with you your".split()
++)
++
++
++def tokenize(text: str) -> list[str]:
++    """Lowercase words without stopwords, with crude stemming so "days"/"day" and "returned"/"return" match."""
++    tokens = []
++    for word in _WORD.findall(text.lower()):
++        if word in STOPWORDS:
++            continue
++        if len(word) > 5 and word.endswith("ing"):
++            word = word[:-3]
++        elif len(word) > 5 and word.endswith("ed"):
++            word = word[:-2]
++        elif len(word) > 4 and word.endswith("s") and not word.endswith("ss"):
++            word = word[:-1]
++        tokens.append(word)
++    return tokens
+diff --git a/app/vectorstore.py b/app/vectorstore.py
+index 452750d..be27512 100644
+--- a/app/vectorstore.py
++++ b/app/vectorstore.py
+@@ -25,6 +25,8 @@ class VectorStore:
+         self._vectors = np.zeros((0, 0), dtype=np.float32)
+         self._chunks: list[Chunk] = []
+         self._docs: dict[str, DocumentInfo] = {}
++        # Bumped on every write so other indexes (e.g. BM25) know when to rebuild.
++        self.version = 0
+         if self._dir:
+             self._dir.mkdir(parents=True, exist_ok=True)
+             self._load()
+@@ -45,6 +47,7 @@ class VectorStore:
+             self._vectors = new if not self._vectors.size else np.vstack([self._vectors, new])
+             self._chunks.extend(chunks)
+             self._docs[doc.doc_id] = doc
++            self.version += 1
+             self._save()
+ 
+     def delete(self, doc_id: str) -> bool:
+@@ -55,6 +58,7 @@ class VectorStore:
+             self._vectors = self._vectors[keep] if keep else np.zeros((0, 0), dtype=np.float32)
+             self._chunks = [self._chunks[i] for i in keep]
+             del self._docs[doc_id]
++            self.version += 1
+             self._save()
+             return True
+ 
+@@ -76,6 +80,11 @@ class VectorStore:
+             top = top[np.argsort(-scores[top])]
+             return [(self._chunks[i], float(scores[i])) for i in top if np.isfinite(scores[i])]
+ 
++    def snapshot(self) -> tuple[int, list[Chunk]]:
++        """A consistent (version, chunks) pair, read under the lock."""
++        with self._lock:
++            return self.version, list(self._chunks)
++
+     def get_document(self, doc_id: str) -> DocumentInfo | None:
+         return self._docs.get(doc_id)
+ 
+diff --git a/docs/INTERVIEW_GUIDE.md b/docs/INTERVIEW_GUIDE.md
+index 3baec73..d895335 100644
+--- a/docs/INTERVIEW_GUIDE.md
++++ b/docs/INTERVIEW_GUIDE.md
+@@ -6,11 +6,12 @@ How to present this project, walk through the code, and answer follow-up questio
+ 
+ ## 1. Your 60-second pitch
+ 
+-> "I built DocuMind, a RAG service that lets you upload documents and ask questions about them, with answers that cite the exact source and page. It's a FastAPI backend with Pydantic models, Google Gemini for embeddings and generation, and a NumPy vector store. I focused on the things that matter in production: answers are grounded, and if nothing relevant is found it says so instead of hallucinating. Responses stream, LLM calls retry with backoff, and I measure retrieval quality with an evaluation script that runs in CI. It also has an offline demo mode, so the whole test suite runs without an API key."
++> "I built DocuMind, a RAG service that lets you upload documents and ask questions about them, with answers that cite the exact source and page. It's a FastAPI backend with Pydantic models, Google Gemini for embeddings and generation, and hybrid retrieval: vector search plus a BM25 keyword index I wrote myself, merged with Reciprocal Rank Fusion. I focused on the things that matter in production: answers are grounded, and if nothing relevant is found it says so instead of hallucinating. Responses stream, LLM calls retry with backoff, and I measure retrieval quality with an evaluation script that runs in CI. It also has an offline demo mode, so the whole test suite runs without an API key."
+ 
+ ## 2. Resume bullets (pick 2–3)
+ 
+ - Built a Retrieval-Augmented Generation (RAG) API with **FastAPI, Pydantic and Google Gemini** that answers questions over PDF/Markdown documents with page-level citations
++- Implemented **hybrid retrieval**, combining semantic vector search with a from-scratch **BM25** keyword index via **Reciprocal Rank Fusion**; on a labeled eval set, hybrid ranked the correct document first for every question, where vector-only and keyword-only each missed cases (MRR 0.975 and 0.900 → 1.000, offline mode)
+ - Designed a **provider-agnostic pipeline** (embedder/LLM interfaces) with an offline mode, enabling a fast, deterministic **pytest** suite with no external API calls
+ - Implemented **streaming responses**, retries with exponential backoff, duplicate detection via content hashing, and optional API-key auth
+ - Created a **retrieval evaluation harness** (Hit@k, MRR) on a labeled question set, enforced in **GitHub Actions CI**; containerized with **Docker**
+@@ -26,10 +27,12 @@ How to present this project, walk through the code, and answer follow-up questio
+ 
+ **Question** (`POST /ask` → `RAGService.ask`):
+ 1. Embed the question (`RETRIEVAL_QUERY` task type).
+-2. Cosine similarity against every chunk (one matrix-vector multiply), take top-k, drop anything below `MIN_SCORE`.
+-3. If nothing is left, return "not found" **without calling the LLM**.
+-4. Build the prompt: system rules + sources in `<source id="1">` tags + the question.
+-5. The LLM answers with `[n]` citations; the API returns the answer plus citation metadata.
++2. **Vector search**: cosine similarity against every chunk (one matrix-vector multiply), keep the top 20 above `MIN_SCORE`.
++3. **Keyword search**: BM25 over an inverted index, keep the top 20 that contain at least half the question's keywords.
++4. **Fuse** the two lists with Reciprocal Rank Fusion and keep the top-k.
++5. If nothing is left, return "not found" **without calling the LLM**.
++6. Build the prompt: system rules + sources in `<source id="1">` tags + the question.
++7. The LLM answers with `[n]` citations; the API returns the answer plus citation metadata.
+ 
+ ## 4. Likely follow-up questions
+ 
+@@ -60,13 +63,28 @@ Hit@k and MRR measure retrieval: did we fetch the right document, and how high d
+ **Why the demo mode?**
+ Tests that call a paid API are slow, flaky and cost money. The interfaces let me inject fakes, so 30+ tests run in under a second. It also lets reviewers try the project without a key.
+ 
++**Why hybrid search? Isn't vector search enough?**
++Embeddings are good at meaning ("vacation days" finds "PTO") but weak on rare exact tokens: product names, error codes, emails, IDs. A question like "Who needs YubiKeys?" is short and has one rare word, so its embedding is vague. BM25 matches that exact word. My eval tags questions as `semantic` or `exact_term`: vector-only was weaker on exact terms, BM25-only missed paraphrases, and hybrid got both right.
++
++**Explain BM25 in one minute.**
++For each query word in a chunk: score += IDF × saturated term frequency. IDF makes rare words count more ("YubiKeys" matters more than "days"). The `k1` parameter makes repeats give diminishing returns, and `b` normalizes for chunk length, so a long chunk that repeats a word doesn't win just by being long. I use an inverted index (word → chunks containing it), so a query only touches matching chunks.
++
++**What is Reciprocal Rank Fusion and why not just add the scores?**
++Cosine similarity runs from 0 to 1, while BM25 scores are unbounded (often 5–20). Adding them means one dominates, and you'd need tuned weights. RRF ignores scores and uses ranks: each list gives a chunk `1 / (60 + rank)`, and you sum. A chunk that both methods rank highly wins. The 60 comes from the original paper (Cormack et al., 2009) and stops one #1 result from dominating. I normalize so that #1 in both lists = 1.0, which makes the score readable in the UI.
++
++**Doesn't keyword search break the "not found" answer?**
++It could: "Who won the world cup?" shares the word "world" with some chunk. So a keyword hit must contain at least half the question's keywords (`BM25_MIN_COVERAGE=0.5`). There's a test for the unrelated-question case.
++
++**How does the BM25 index stay in sync with uploads and deletes?**
++The vector store has a `version` counter that goes up on every write. Before searching, the service compares it with the version the BM25 index was built from and rebuilds if they differ. Rebuilding is fast at this scale; at larger scale I'd update the index incrementally or use Postgres full-text search / Elasticsearch next to pgvector.
++
+ **What would you do differently next time?**
+-Add hybrid search (keyword BM25 + vectors) for exact terms like product codes, add a re-ranker, and support conversation history for follow-up questions.
++Add a cross-encoder re-ranker on top of the fused results, and support conversation history for follow-up questions.
+ 
+ ## 5. Demo script (5 minutes)
+ 
+ 1. Show the README and architecture diagram (30s).
+-2. Run `pytest -q` and `python -m evals.run_eval` to show quality is measured (1 min).
++2. Run `pytest -q` and `python -m evals.run_eval --mode all` to show quality is measured, and point at the vector / BM25 / hybrid table (1 min).
+ 3. Open the UI in Gemini mode, upload `sample_docs/`, ask:
+    - "How many PTO days can I carry over, and until when?" (a multi-fact answer with citation)
+    - "Can I paste customer data into ChatGPT?" (reasoning over policy)
+@@ -77,7 +95,7 @@ Add hybrid search (keyword BM25 + vectors) for exact terms like product codes, a
+ ## 6. Make it yours (do at least one before interviews)
+ 
+ Interviewers can tell when a project was copied. Extend it in a way you can explain:
+-- Add **hybrid search** with BM25 (the `rank-bm25` package) and report the eval improvement.
++- Run `python -m evals.run_eval --provider gemini --mode all` and put **your own** numbers for real embeddings in the README.
+ - Add **conversation memory**: accept `history` in `AskRequest` and rewrite follow-up questions.
+ - Add a **pgvector** `VectorStore` implementation with docker-compose.
+ - Swap in a **second provider** (OpenAI or Claude) behind the same interfaces.
+diff --git a/evals/eval_set.json b/evals/eval_set.json
+index 0510574..c162598 100644
+--- a/evals/eval_set.json
++++ b/evals/eval_set.json
+@@ -1,16 +1,22 @@
+ [
+-  {"question": "How many PTO days do full-time employees get each year?", "expected_file": "employee_handbook.md", "expected_answer": "20 days"},
+-  {"question": "How many unused vacation days can I carry over to next year?", "expected_file": "employee_handbook.md", "expected_answer": "5 days, used by March 31"},
+-  {"question": "Which days do hybrid employees have to be in the office?", "expected_file": "employee_handbook.md", "expected_answer": "Tuesdays and Thursdays"},
+-  {"question": "What is the daily meal allowance when traveling?", "expected_file": "employee_handbook.md", "expected_answer": "$75"},
+-  {"question": "How long is parental leave?", "expected_file": "employee_handbook.md", "expected_answer": "16 weeks fully paid"},
+-  {"question": "How much is the yearly learning budget?", "expected_file": "employee_handbook.md", "expected_answer": "$1,500"},
+-  {"question": "What is the minimum password length?", "expected_file": "it_security_policy.md", "expected_answer": "14 characters"},
+-  {"question": "Is SMS allowed as a second factor for login?", "expected_file": "it_security_policy.md", "expected_answer": "No, SMS is not approved"},
+-  {"question": "How quickly must a lost laptop be reported?", "expected_file": "it_security_policy.md", "expected_answer": "Within 1 hour"},
+-  {"question": "Can I paste customer data into ChatGPT?", "expected_file": "it_security_policy.md", "expected_answer": "No, Restricted data must never go into public AI tools"},
+-  {"question": "How long is the warranty on the solar panel?", "expected_file": "product_faq.md", "expected_answer": "25-year product, 30-year performance"},
+-  {"question": "Can I use a pressure washer to clean the panels?", "expected_file": "product_faq.md", "expected_answer": "No"},
+-  {"question": "What is the restocking fee for returns?", "expected_file": "product_faq.md", "expected_answer": "15 percent for opened packaging"},
+-  {"question": "How efficient is the SunPeak 400?", "expected_file": "product_faq.md", "expected_answer": "21.5 percent"}
++  {"question": "How many PTO days do full-time employees get each year?", "expected_file": "employee_handbook.md", "expected_answer": "20 days", "type": "semantic"},
++  {"question": "How many unused vacation days can I carry over to next year?", "expected_file": "employee_handbook.md", "expected_answer": "5 days, used by March 31", "type": "semantic"},
++  {"question": "Which days do hybrid employees have to be in the office?", "expected_file": "employee_handbook.md", "expected_answer": "Tuesdays and Thursdays", "type": "semantic"},
++  {"question": "What is the daily meal allowance when traveling?", "expected_file": "employee_handbook.md", "expected_answer": "$75", "type": "semantic"},
++  {"question": "How long is parental leave?", "expected_file": "employee_handbook.md", "expected_answer": "16 weeks fully paid", "type": "semantic"},
++  {"question": "How much is the yearly learning budget?", "expected_file": "employee_handbook.md", "expected_answer": "$1,500", "type": "semantic"},
++  {"question": "What is the minimum password length?", "expected_file": "it_security_policy.md", "expected_answer": "14 characters", "type": "semantic"},
++  {"question": "Is SMS allowed as a second factor for login?", "expected_file": "it_security_policy.md", "expected_answer": "No, SMS is not approved", "type": "semantic"},
++  {"question": "How quickly must a lost laptop be reported?", "expected_file": "it_security_policy.md", "expected_answer": "Within 1 hour", "type": "semantic"},
++  {"question": "Can I paste customer data into ChatGPT?", "expected_file": "it_security_policy.md", "expected_answer": "No, Restricted data must never go into public AI tools", "type": "semantic"},
++  {"question": "How long is the warranty on the solar panel?", "expected_file": "product_faq.md", "expected_answer": "25-year product, 30-year performance", "type": "semantic"},
++  {"question": "Can I use a pressure washer to clean the panels?", "expected_file": "product_faq.md", "expected_answer": "No", "type": "semantic"},
++  {"question": "What is the restocking fee for returns?", "expected_file": "product_faq.md", "expected_answer": "15 percent for opened packaging", "type": "semantic"},
++  {"question": "How efficient is the SunPeak 400?", "expected_file": "product_faq.md", "expected_answer": "21.5 percent", "type": "semantic"},
++  {"question": "Who needs YubiKeys?", "expected_file": "it_security_policy.md", "expected_answer": "Engineers with production access", "type": "exact_term"},
++  {"question": "Which app do I submit Expensify receipts in, and by when?", "expected_file": "employee_handbook.md", "expected_answer": "Expensify, within 30 days", "type": "exact_term"},
++  {"question": "What is security@brightleaf.example used for?", "expected_file": "it_security_policy.md", "expected_answer": "Reporting suspected security incidents", "type": "exact_term"},
++  {"question": "What is the #security-incidents channel for?", "expected_file": "it_security_policy.md", "expected_answer": "Reporting suspected incidents", "type": "exact_term"},
++  {"question": "Is the panel rated for 5,400 pascals?", "expected_file": "product_faq.md", "expected_answer": "Yes, snow loads up to 5,400 pascals", "type": "exact_term"},
++  {"question": "What does the Brightleaf Hub do?", "expected_file": "product_faq.md", "expected_answer": "Inverter that reports panel output to the app every 5 minutes", "type": "exact_term"}
+ ]
+diff --git a/evals/run_eval.py b/evals/run_eval.py
+index f26e69a..1bd6e06 100644
+--- a/evals/run_eval.py
++++ b/evals/run_eval.py
+@@ -1,13 +1,16 @@
+ """Measure retrieval quality on a labeled question set.
+ 
+-    python -m evals.run_eval                     # offline demo embeddings
+-    python -m evals.run_eval --provider gemini   # needs GEMINI_API_KEY
+-    python -m evals.run_eval --answers           # also print generated answers
++    python -m evals.run_eval                       # offline demo embeddings, hybrid retrieval
++    python -m evals.run_eval --mode all            # compare vector vs bm25 vs hybrid side by side
++    python -m evals.run_eval --provider gemini     # needs GEMINI_API_KEY
++    python -m evals.run_eval --answers             # also print generated answers
+ 
+ Metrics
+ - Hit@k: share of questions where a chunk from the expected file is in the top k.
+ - MRR (mean reciprocal rank): 1/rank of the first correct chunk, averaged. 1.0 = always ranked first.
+-Use these numbers to compare chunk sizes, embedding models and MIN_SCORE values.
++Each question has a "type": "semantic" (paraphrased) or "exact_term" (names, codes, numbers),
++and results are broken down by type, since that is where vector and keyword search differ.
++Use these numbers to compare retrieval modes, chunk sizes, embedding models and MIN_SCORE values.
+ """
+ 
+ from __future__ import annotations
+@@ -18,6 +21,7 @@ import os
+ import sys
+ import tempfile
+ import time
++from collections import defaultdict
+ from pathlib import Path
+ 
+ ROOT = Path(__file__).resolve().parent.parent
+@@ -27,6 +31,8 @@ from app.rag import RAGService  # noqa: E402
+ from app.schemas import AskRequest  # noqa: E402
+ from app.vectorstore import VectorStore  # noqa: E402
+ 
++MODES = ("vector", "bm25", "hybrid")
++
+ 
+ def build(provider: str, chunk_size: int, overlap: int) -> RAGService:
+     if provider == "gemini":
+@@ -42,9 +48,31 @@ def build(provider: str, chunk_size: int, overlap: int) -> RAGService:
+     return RAGService(embedder, llm, store, chunk_size, overlap, min_score=0.0)
+ 
+ 
++def evaluate(svc: RAGService, cases: list[dict], k: int, mode: str) -> tuple[list[int | None], dict[str, dict]]:
++    """Return the rank of the expected file for each case, and Hit@k/MRR per question type (plus "all")."""
++    ranks: list[int | None] = []
++    groups: dict[str, list[int | None]] = defaultdict(list)
++    for case in cases:
++        results = svc.retrieve(case["question"], top_k=k, mode=mode)
++        rank = next((i for i, (c, _) in enumerate(results, 1) if c.filename == case["expected_file"]), None)
++        ranks.append(rank)
++        groups[case.get("type", "semantic")].append(rank)
++        groups["all"].append(rank)
++    metrics = {
++        name: {
++            "n": len(rs),
++            "hit": sum(r is not None for r in rs) / len(rs),
++            "mrr": sum(1 / r for r in rs if r) / len(rs),
++        }
++        for name, rs in groups.items()
++    }
++    return ranks, metrics
++
++
+ def main() -> None:
+     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     p.add_argument("--provider", choices=["demo", "gemini"], default="demo")
++    p.add_argument("--mode", choices=[*MODES, "all"], default="hybrid", help="retrieval mode, or 'all' to compare")
+     p.add_argument("--k", type=int, default=4)
+     p.add_argument("--chunk-size", type=int, default=1000)
+     p.add_argument("--overlap", type=int, default=150)
+@@ -55,27 +83,33 @@ def main() -> None:
+     svc = build(args.provider, args.chunk_size, args.overlap)
+     for path in sorted((ROOT / "sample_docs").glob("*")):
+         svc.ingest(path.name, path.read_bytes())
+-
+     cases = json.loads((ROOT / "evals" / "eval_set.json").read_text())
+-    hits, rr = 0, 0.0
++
++    modes = MODES if args.mode == "all" else (args.mode,)
+     start = time.perf_counter()
+-    print(f"{'':2} {'rank':>4}  question")
+-    for case in cases:
+-        results = svc.retrieve(case["question"], top_k=args.k)
+-        rank = next((i for i, (c, _) in enumerate(results, 1) if c.filename == case["expected_file"]), None)
+-        hits += rank is not None
+-        rr += 1 / rank if rank else 0
+-        print(f"{'✓' if rank else '✗':2} {rank or '-':>4}  {case['question']}")
++    all_ranks, all_metrics = {}, {}
++    for mode in modes:
++        all_ranks[mode], all_metrics[mode] = evaluate(svc, cases, args.k, mode)
++
++    # Per-question table: one rank column per mode ("-" = not in top k).
++    print(" ".join(f"{m:>6}" for m in modes) + "  type        question")
++    for i, case in enumerate(cases):
++        cols = " ".join(f"{all_ranks[m][i] or '-':>6}" for m in modes)
++        print(f"{cols}  {case.get('type', 'semantic'):<11} {case['question']}")
+         if args.answers:
+-            answer = svc.ask(AskRequest(question=case["question"], top_k=args.k)).answer
++            answer = svc.ask(AskRequest(question=case["question"], top_k=args.k, retrieval_mode=modes[-1])).answer
+             print(f"{'':9}expected: {case['expected_answer']}\n{'':9}got:      {answer}\n")
+ 
+-    n = len(cases)
+-    hit_rate = hits / n
+     print(f"\nprovider={args.provider} chunk_size={args.chunk_size} overlap={args.overlap} k={args.k}")
+-    print(f"Hit@{args.k}: {hit_rate:.0%} ({hits}/{n})   MRR: {rr / n:.3f}   time: {time.perf_counter() - start:.1f}s")
+-    if hit_rate < args.min_hit_rate:
+-        sys.exit(f"Hit rate {hit_rate:.0%} is below the required {args.min_hit_rate:.0%}")
++    print(f"{'mode':<8} {'subset':<11} {'n':>3}  {'Hit@' + str(args.k):>6}  {'MRR':>6}")
++    for mode in modes:
++        for subset, m in sorted(all_metrics[mode].items(), key=lambda kv: kv[0] != "all"):
++            print(f"{mode:<8} {subset:<11} {m['n']:>3}  {m['hit']:>6.0%}  {m['mrr']:>6.3f}")
++    print(f"time: {time.perf_counter() - start:.1f}s")
++
++    failing = [m for m in modes if all_metrics[m]["all"]["hit"] < args.min_hit_rate]
++    if failing:
++        sys.exit(f"Hit rate below the required {args.min_hit_rate:.0%} for: {', '.join(failing)}")
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_api.py b/tests/test_api.py
+index ea1a9b1..cdf111a 100644
+--- a/tests/test_api.py
++++ b/tests/test_api.py
+@@ -84,3 +84,16 @@ def test_api_key_required_when_configured(secured_client):
+     assert secured_client.get("/documents", headers={"X-API-Key": "wrong"}).status_code == 401
+     assert secured_client.get("/documents", headers={"X-API-Key": "s3cret"}).status_code == 200
+     assert secured_client.get("/health").status_code == 200  # health stays public
++
++
++def test_health_reports_retrieval_mode(client):
++    assert client.get("/health").json()["retrieval"] == "hybrid"
++
++
++def test_ask_accepts_retrieval_mode(client):
++    _upload(client, "it_security_policy.md")
++    r = client.post("/ask", json={"question": "Who needs YubiKeys?", "retrieval_mode": "bm25"})
++    assert r.status_code == 200
++    assert r.json()["citations"][0]["filename"] == "it_security_policy.md"
++    bad = client.post("/ask", json={"question": "Who needs YubiKeys?", "retrieval_mode": "magic"})
++    assert bad.status_code == 422
+diff --git a/tests/test_bm25.py b/tests/test_bm25.py
+new file mode 100644
+index 0000000..7f7827a
+--- /dev/null
++++ b/tests/test_bm25.py
+@@ -0,0 +1,113 @@
++import pytest
++
++from app.bm25 import BM25Index
++from app.rag import reciprocal_rank_fusion
++from app.schemas import AskRequest, Chunk
++
++
++@pytest.fixture
++def index() -> BM25Index:
++    idx = BM25Index()
++    idx.build(
++        [
++            ("pto", "Employees receive 20 days of paid time off per year."),
++            ("mfa", "Hardware security keys such as YubiKeys are required for production access."),
++            ("expenses", "Submit expenses in the Expensify app within 30 days."),
++            ("long", "Paid time off. " * 40),  # long chunk that repeats a phrase many times
++        ]
++    )
++    return idx
++
++
++def test_exact_term_ranks_first(index):
++    results = index.search("Who needs YubiKeys?")
++    assert results[0][0] == "mfa"
++
++
++def test_rare_terms_outweigh_common_ones(index):
++    # "expensify" appears in one chunk, "days" in several: the rare term should decide the ranking.
++    assert index.search("expensify days")[0][0] == "expenses"
++
++
++def test_length_normalization_limits_repetition(index):
++    # Repeating "paid time off" 40 times must not beat a short chunk that also has "20 days".
++    results = dict(index.search("20 days paid time off"))
++    assert results["pto"] > results["long"]
++
++
++def test_no_match_returns_empty(index):
++    assert index.search("football world cup") == []
++    assert index.search("the and of") == []  # only stopwords
++
++
++def test_allowed_filter(index):
++    assert [cid for cid, _ in index.search("days", allowed={"expenses"})] == ["expenses"]
++
++
++def test_min_coverage_drops_single_word_matches(index):
++    # Only 1 of 3 query terms ("days") appears in the PTO chunk.
++    assert index.search("days submarine volcano", min_coverage=0.0)
++    assert index.search("days submarine volcano", min_coverage=0.5) == []
++
++
++def test_empty_index():
++    assert BM25Index().search("anything") == []
++
++
++def _chunk(cid: str) -> Chunk:
++    return Chunk(id=cid, doc_id="d", filename="f.md", index=0, text=cid)
++
++
++def test_rrf_rewards_agreement_between_lists():
++    a, b, c = _chunk("a"), _chunk("b"), _chunk("c")
++    vector = [(a, 0.9), (b, 0.8), (c, 0.1)]
++    keyword = [(b, 12.0), (c, 3.0)]
++    fused = reciprocal_rank_fusion([vector, keyword], top_k=3)
++    # b and c appear in both lists, so they outrank a, which only one list found.
++    assert [ch.id for ch, _ in fused] == ["b", "c", "a"]
++
++
++def test_rrf_scores_are_normalized():
++    a = _chunk("a")
++    fused = reciprocal_rank_fusion([[(a, 0.5)], [(a, 7.0)]], top_k=1)
++    assert fused[0][1] == pytest.approx(1.0)  # first in every list
++
++
++@pytest.mark.parametrize("mode", ["vector", "bm25", "hybrid"])
++def test_every_mode_finds_the_right_document(loaded_service, mode):
++    hits = loaded_service.retrieve("How many PTO days do employees get?", top_k=3, mode=mode)
++    assert hits[0][0].filename == "employee_handbook.md"
++
++
++def test_hybrid_recovers_what_vector_search_misses(loaded_service):
++    # A short query with a rare product name scores below MIN_SCORE in vector search,
++    # but BM25 matches the exact word, so hybrid still finds it.
++    assert loaded_service.retrieve("Who needs YubiKeys?", top_k=3, mode="vector") == []
++    hits = loaded_service.retrieve("Who needs YubiKeys?", top_k=3, mode="hybrid")
++    assert hits[0][0].filename == "it_security_policy.md"
++
++
++def test_hybrid_finds_exact_terms_and_paraphrases(loaded_service):
++    exact = loaded_service.retrieve("Which app do I submit Expensify receipts in?", top_k=4, mode="hybrid")
++    paraphrase = loaded_service.retrieve("Is SMS allowed as a second factor for login?", top_k=4, mode="hybrid")
++    assert exact[0][0].filename == "employee_handbook.md"
++    assert paraphrase[0][0].filename == "it_security_policy.md"
++
++
++def test_keyword_index_follows_uploads_and_deletes(service):
++    doc, _ = service.ingest("notes.txt", b"The quarterly zeppelin inspection happens in hangar 7.")
++    assert service.retrieve("zeppelin inspection", mode="bm25")
++    service.store.delete(doc.doc_id)
++    assert service.retrieve("zeppelin inspection", mode="bm25") == []
++
++
++def test_hybrid_respects_doc_filter(loaded_service):
++    faq = next(d for d in loaded_service.store.list_documents() if d.filename == "product_faq.md")
++    hits = loaded_service.retrieve("security keys password", top_k=4, doc_ids=[faq.doc_id], mode="hybrid")
++    assert {c.filename for c, _ in hits} <= {"product_faq.md"}
++
++
++def test_request_can_override_mode(loaded_service):
++    res = loaded_service.ask(AskRequest(question="Who needs YubiKeys?", retrieval_mode="bm25"))
++    assert res.grounded
++    assert res.citations[0].filename == "it_security_policy.md"

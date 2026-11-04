@@ -27,4 +27,7 @@ def build_service(settings: Settings) -> RAGService:
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
         min_score=settings.resolved_min_score,
+        retrieval_mode=settings.retrieval_mode,
+        rrf_k=settings.rrf_k,
+        bm25_min_coverage=settings.bm25_min_coverage,
     )

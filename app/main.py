@@ -78,6 +78,7 @@ def create_app(settings: Settings | None = None, service: RAGService | None = No
             "version": __version__,
             "embedder": svc.embedder.name,
             "llm": svc.llm.name,
+            "retrieval": svc.retrieval_mode,
             "documents": len(svc.store.list_documents()),
             "chunks": len(svc.store),
         }

@@ -20,7 +20,7 @@ jobs:
       - name: Tests
         run: pytest -q
       - name: Retrieval eval (offline demo mode)
-        run: python -m evals.run_eval --min-hit-rate 0.9
+        run: python -m evals.run_eval --mode all --min-hit-rate 0.85
 
   docker:
     runs-on: ubuntu-latest

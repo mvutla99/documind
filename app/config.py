@@ -9,6 +9,8 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.schemas import RetrievalMode
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -27,6 +29,12 @@ class Settings(BaseSettings):
     # None = provider default (demo 0.1, gemini 0.0).
     min_score: float | None = None
     max_upload_mb: int = Field(20, gt=0)
+
+    # hybrid = vector search + BM25 keyword search fused with Reciprocal Rank Fusion.
+    retrieval_mode: RetrievalMode = "hybrid"
+    rrf_k: int = Field(60, ge=1)
+    # A keyword hit must contain at least this share of the question's keywords.
+    bm25_min_coverage: float = Field(0.5, ge=0, le=1)
 
     # If set, every API call must send the header "X-API-Key: <value>".
     api_key: str | None = None

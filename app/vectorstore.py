@@ -25,6 +25,8 @@ class VectorStore:
         self._vectors = np.zeros((0, 0), dtype=np.float32)
         self._chunks: list[Chunk] = []
         self._docs: dict[str, DocumentInfo] = {}
+        # Bumped on every write so other indexes (e.g. BM25) know when to rebuild.
+        self.version = 0
         if self._dir:
             self._dir.mkdir(parents=True, exist_ok=True)
             self._load()
@@ -45,6 +47,7 @@ class VectorStore:
             self._vectors = new if not self._vectors.size else np.vstack([self._vectors, new])
             self._chunks.extend(chunks)
             self._docs[doc.doc_id] = doc
+            self.version += 1
             self._save()
 
     def delete(self, doc_id: str) -> bool:
@@ -55,6 +58,7 @@ class VectorStore:
             self._vectors = self._vectors[keep] if keep else np.zeros((0, 0), dtype=np.float32)
             self._chunks = [self._chunks[i] for i in keep]
             del self._docs[doc_id]
+            self.version += 1
             self._save()
             return True
 
@@ -75,6 +79,11 @@ class VectorStore:
             top = np.argpartition(-scores, k - 1)[:k]
             top = top[np.argsort(-scores[top])]
             return [(self._chunks[i], float(scores[i])) for i in top if np.isfinite(scores[i])]
+
+    def snapshot(self) -> tuple[int, list[Chunk]]:
+        """A consistent (version, chunks) pair, read under the lock."""
+        with self._lock:
+            return self.version, list(self._chunks)
 
     def get_document(self, doc_id: str) -> DocumentInfo | None:
         return self._docs.get(doc_id)

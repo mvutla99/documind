@@ -84,3 +84,16 @@ def test_api_key_required_when_configured(secured_client):
     assert secured_client.get("/documents", headers={"X-API-Key": "wrong"}).status_code == 401
     assert secured_client.get("/documents", headers={"X-API-Key": "s3cret"}).status_code == 200
     assert secured_client.get("/health").status_code == 200  # health stays public
+
+
+def test_health_reports_retrieval_mode(client):
+    assert client.get("/health").json()["retrieval"] == "hybrid"
+
+
+def test_ask_accepts_retrieval_mode(client):
+    _upload(client, "it_security_policy.md")
+    r = client.post("/ask", json={"question": "Who needs YubiKeys?", "retrieval_mode": "bm25"})
+    assert r.status_code == 200
+    assert r.json()["citations"][0]["filename"] == "it_security_policy.md"
+    bad = client.post("/ask", json={"question": "Who needs YubiKeys?", "retrieval_mode": "magic"})
+    assert bad.status_code == 422

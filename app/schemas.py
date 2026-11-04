@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+RetrievalMode = Literal["vector", "bm25", "hybrid"]
+
 
 class Chunk(BaseModel):
     """A piece of a document that gets embedded and stored."""
@@ -32,6 +34,9 @@ class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000, examples=["How many PTO days do I get?"])
     top_k: int = Field(4, ge=1, le=20, description="How many chunks to retrieve")
     doc_ids: list[str] | None = Field(None, description="Only search these documents")
+    retrieval_mode: RetrievalMode | None = Field(
+        None, description="Override the server default: vector, bm25 (keywords) or hybrid (both, fused)"
+    )
 
 
 class Citation(BaseModel):
@@ -39,7 +44,7 @@ class Citation(BaseModel):
     doc_id: str
     filename: str
     page: int | None = None
-    score: float
+    score: float = Field(..., description="Relevance: cosine similarity, BM25 score, or normalized RRF score (hybrid)")
     snippet: str
 
 
